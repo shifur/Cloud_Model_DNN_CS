@@ -1,17 +1,46 @@
 # log_prob_dnn11d.py
 import numpy as np
-from ensemble_da import P_Gaussian
 from dnn_emulator_11d import DNN11D
 
 _emul = None
+
+# Cache mask-derived constants so they are not recomputed on every call.
+# Safe for single-process use (DNN MCMC runs without a multiprocessing Pool).
+_cache = {
+    "y_mask_key": None,
+    "sel_idx":    None,
+    "log_norm":   None,
+    "inv_var":    None,
+}
+
+
 def _fail_blob():
-    return np.array([-np.inf] + [np.nan]*6, dtype=float)
+    return np.array([-np.inf] + [np.nan] * 6, dtype=float)
+
+
+def _prep_mask_cache(y_mask, y_sig_six):
+    y_mask_key = tuple(np.asarray(y_mask, dtype=int).tolist())
+    if _cache["y_mask_key"] == y_mask_key:
+        return
+
+    sel_idx = np.where(np.asarray(y_mask, dtype=int) == 1)[0]
+    sig     = np.asarray(y_sig_six, dtype=float)[sel_idx]
+    var     = sig * sig
+    d       = sel_idx.size
+    _cache["y_mask_key"] = y_mask_key
+    _cache["sel_idx"]    = sel_idx
+    _cache["inv_var"]    = 1.0 / var
+    _cache["log_norm"]   = float(-0.5 * (d * np.log(2.0 * np.pi) + np.sum(np.log(var))))
+
 
 def log_prob_dnn11d(xp, xtrue, L1_six, y_sig_six,
                     pmin_full, pmax_full, PMask, y_mask, LType=1):
     global _emul
     if _emul is None:
         _emul = DNN11D('models_11d/dnn11d_model.pt')
+
+    if LType == 1:
+        _prep_mask_cache(y_mask, y_sig_six)
 
     x = xtrue.copy()
     pidx = np.nonzero(PMask)[0]
@@ -21,11 +50,14 @@ def log_prob_dnn11d(xp, xtrue, L1_six, y_sig_six,
 
     y_pred = _emul.predict(x[None, :])[0]
 
-    sel = (np.asarray(y_mask, dtype=int) == 1)
-    mu  = L1_six[sel]
-    obs = y_pred[sel]
-    Sig = np.diag((y_sig_six[sel] ** 2))
-    log_like = P_Gaussian(obs, mu, Sig) if LType == 1 else 0.0
+    if LType == 1:
+        sel_idx  = _cache["sel_idx"]
+        mu       = np.asarray(L1_six, dtype=float)[sel_idx]
+        obs      = np.asarray(y_pred, dtype=float)[sel_idx]
+        diff     = obs - mu
+        log_like = _cache["log_norm"] - 0.5 * np.sum((diff * diff) * _cache["inv_var"])
+    else:
+        log_like = 0.0
 
     blob = np.concatenate([[log_like], y_pred])
-    return log_like, blob
+    return float(log_like), blob
