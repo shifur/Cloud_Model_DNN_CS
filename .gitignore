@@ -1,0 +1,18 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Run outputs
+runs/
+FINAL_PDR11D_*/
+FINAL_CRM11D_*/
+
+# Trained model files
+models_11d/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
