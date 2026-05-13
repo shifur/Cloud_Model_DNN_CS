@@ -108,13 +108,16 @@ def run_case(USE_RADIATION: bool,
 
     Xa      = sampler.get_chain()
     log_pxy = sampler.get_log_prob()
-    blobs   = sampler.get_blobs()
+    blobs = sampler.get_blobs()
     try:
         blobs = blobs["Hx"]
     except Exception:
         pass
-    log_pyx = blobs[:, :, 0]
-    HXa     = blobs[:, :, 1:]
+    blobs = np.asarray(blobs)
+    if blobs.dtype == object:
+        blobs = np.array(blobs.tolist(), dtype=np.float64)
+    log_pyx = np.asarray(blobs[:, :, 0])
+    HXa     = np.asarray(blobs[:, :, 1:])
 
     acc = float(np.mean(sampler.acceptance_fraction))
     print(f"Mean acceptance (PDR{run_note}): {acc:.3f}")
