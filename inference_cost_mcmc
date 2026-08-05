@@ -1,0 +1,426 @@
+"""
+Inference Cost: DNN vs CS
+- Single output for BOTH DNN and CS
+- CS = precomputed basis contraction only: Basis @ C
+- Experimental plot: TOTAL estimated runtime over MCMC for DNN vs CS
+- Theoretical plot: TOTAL inference ops over MCMC
+- MCMC settings: burn=50, mcmc=500, n_walk=64
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+import os
+import warnings
+warnings.filterwarnings("ignore")
+
+import torch
+from torch import nn
+
+# ── CuPy for CS ───────────────────────────────────────────────────────────────
+try:
+    import cupy as cp
+    _HAS_CUPY = True
+    xp = cp
+    print("CuPy found → CS will run on GPU")
+except ImportError:
+    _HAS_CUPY = False
+    xp = np
+    print("CuPy NOT found → CS falls back to CPU numpy")
+
+# ── Parameters ────────────────────────────────────────────────────────────────
+d = 11
+H = 50
+L = 8
+K = 1
+OUTPUT_IDX = 0
+N_d = 4291
+
+N_TEST = 1000
+N_RUNS = 5
+RNG_SEED = 99
+
+MODEL_DIR = 'saved_models'
+M_SAVE = 5000
+
+# MCMC settings
+N_BURN = 50
+N_MCMC = 500
+N_WALK = 64
+T_MCMC = (N_BURN + N_MCMC) * N_WALK   # total number of forward evaluations
+
+pmin = np.array([50., 0.10, 50., 0.1, 0.05, 0.05, 0.05, 0.05, 0.05, 1.e-4, 2.e-6])
+pmax = np.array([1000., 1., 1200., 0.90, 5., 2.5, 2.5, 1., 1., 2.e-3, 1.e-3])
+
+# ── Theoretical ops per sample ────────────────────────────────────────────────
+# DNN:
+# input -> Linear(d,H) -> tanh
+# then L times: Linear(H,H) -> tanh
+# final: Linear(H,1)
+W_fwd = d * H + L * H * H + H * K
+b_fwd = (L + 1) * H + K
+s_fwd = (L + 1) * H
+C_FWD_DNN = W_fwd + b_fwd + s_fwd
+
+# CS contraction-only cost
+C_CS = N_d * K
+
+# Total theoretical inference cost over MCMC
+TOT_DNN = C_FWD_DNN * T_MCMC
+TOT_CS = C_CS * T_MCMC
+
+print(f"\nper forward pass theoretical cost:")
+print(f"DNN: C_fwd = {W_fwd:,} + {b_fwd:,} + {s_fwd:,} = {C_FWD_DNN:,} ops per forward pass")
+print(f"CS : C_CS  = N(d) × K = {N_d:,} × {K} = {C_CS:,} ops per forward pass")
+
+print(f"\nMCMC settings:")
+print(f"n_burn = {N_BURN}, n_mcmc = {N_MCMC}, n_walk = {N_WALK}")
+print(f"T_MCMC = ({N_BURN} + {N_MCMC}) × {N_WALK} = {T_MCMC:,}")
+
+print(f"\nTotal theoretical inference cost over MCMC:")
+print(f"DNN total = {C_FWD_DNN:,} × {T_MCMC:,} = {TOT_DNN:,} ops")
+print(f"CS  total = {C_CS:,} × {T_MCMC:,} = {TOT_CS:,} ops")
+print(f"Ratio DNN / CS = {TOT_DNN / TOT_CS:.2f}×")
+
+# ── Sync helpers ──────────────────────────────────────────────────────────────
+def sync_cupy():
+    if _HAS_CUPY:
+        cp.cuda.Stream.null.synchronize()
+
+def sync_torch(device):
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+
+# ── DNN model ─────────────────────────────────────────────────────────────────
+class DNN(nn.Module):
+    def __init__(self, inp, out=1, nl=L, hid=H):
+        super().__init__()
+        layers = [nn.Linear(inp, hid), nn.Tanh()]
+        for _ in range(nl):
+            layers += [nn.Linear(hid, hid), nn.Tanh()]
+        layers += [nn.Linear(hid, out)]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def canon(X, lo, hi):
+    return 2.0 * (X - lo) / (hi - lo) - 1.0
+
+def leg_rec_gpu(x_dev, max_deg, dtype):
+    """
+    3-term Legendre recurrence on GPU (CuPy) or CPU (numpy).
+    x_dev   : (N_TEST,)
+    returns : (max_deg+1, N_TEST)
+    """
+    P = xp.empty((max_deg + 1, x_dev.shape[0]), dtype=dtype)
+    P[0] = 1.0
+    if max_deg >= 1:
+        P[1] = x_dev
+    for k in range(2, max_deg + 1):
+        P[k] = ((2 * k - 1) * x_dev * P[k - 1] - (k - 1) * P[k - 2]) / k
+    return P
+
+def build_basis_gpu(xi_dev, Lambda_dev):
+    """
+    Build the full orthonormal basis matrix.
+    xi_dev     : (N_TEST, d)
+    Lambda_dev : (N_basis, d)
+    Returns    : (N_TEST, N_basis)
+    """
+    n, dd = xi_dev.shape
+    N_basis = Lambda_dev.shape[0]
+    dtype = xi_dev.dtype
+
+    Pdim = []
+    for kdim in range(dd):
+        max_deg = int(Lambda_dev[:, kdim].max())
+        Pdim.append(leg_rec_gpu(xi_dev[:, kdim], max_deg, dtype))
+
+    Basis_dev = xp.ones((n, N_basis), dtype=dtype)
+
+    for kdim in range(dd):
+        degs = Lambda_dev[:, kdim]
+        vals = Pdim[kdim][degs, :].T
+        norms = xp.sqrt((2 * degs + 1).astype(dtype))
+        Basis_dev *= vals * norms[xp.newaxis, :]
+
+    return Basis_dev
+
+def cs_predict_gpu(Basis_dev, C_dev):
+    """
+    CS inference = precomputed basis contraction only
+    """
+    return Basis_dev @ C_dev
+
+def slice_checkpoint_to_single_output(state_dict, output_idx=0):
+    """
+    Convert a multi-output checkpoint into a single-output state_dict
+    by slicing the final layer.
+    Assumes final layer keys are net.18.weight and net.18.bias.
+    """
+    sd = {k: v.clone() for k, v in state_dict.items()}
+
+    final_w_key = 'net.18.weight'
+    final_b_key = 'net.18.bias'
+
+    if final_w_key not in sd or final_b_key not in sd:
+        raise KeyError(
+            f"Expected final layer keys '{final_w_key}' and '{final_b_key}' not found."
+        )
+
+    sd[final_w_key] = sd[final_w_key][output_idx:output_idx+1, :].contiguous()
+    sd[final_b_key] = sd[final_b_key][output_idx:output_idx+1].contiguous()
+
+    return sd
+
+# ── Load models ───────────────────────────────────────────────────────────────
+device   = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+pdr_path = os.path.join(MODEL_DIR, f'd{d}_m{M_SAVE}_pdr.npz')
+dnn_path = os.path.join(MODEL_DIR, f'd{d}_m{M_SAVE}_dnn.pt')
+
+print(f"\nPyTorch device : {device}")
+print(f"CS device      : {'GPU (CuPy)' if _HAS_CUPY else 'CPU (numpy)'}")
+print(f"N_TEST         : {N_TEST}")
+print(f"N_RUNS         : {N_RUNS}")
+
+# Fixed test set
+np.random.seed(RNG_SEED)
+x_test = np.random.uniform(pmin, pmax, size=(N_TEST, d)).astype(np.float32)
+
+# ── Load CS model and keep one output only ────────────────────────────────────
+data      = np.load(pdr_path, allow_pickle=True)
+Lambda_np = data['Lambda'].astype(np.int32)
+C_np      = data['C_six'][:, OUTPUT_IDX].astype(np.float32)
+pmin_pd   = data['pmin_d']
+pmax_pd   = data['pmax_d']
+N_basis   = int(data['N_basis'])
+
+xi_np = canon(x_test, pmin_pd, pmax_pd).astype(np.float32)
+
+Lambda_dev = xp.asarray(Lambda_np)
+C_dev      = xp.asarray(C_np)
+xi_dev     = xp.asarray(xi_np)
+
+print(f"\nCS: N_basis={N_basis:,} | using output OUTPUT_IDX={OUTPUT_IDX}")
+print(f"CS: Lambda + C + xi pre-loaded to {'GPU (CuPy)' if _HAS_CUPY else 'CPU (numpy)'}")
+
+# Precompute basis once outside timing
+Basis_dev = build_basis_gpu(xi_dev, Lambda_dev)
+sync_cupy()
+print(f"CS: basis precomputed once with shape {Basis_dev.shape}")
+
+# Warm-up CS
+_ = cs_predict_gpu(Basis_dev, C_dev)
+sync_cupy()
+
+# Timed runs — CS only
+cs_runs = []
+for _ in range(N_RUNS):
+    sync_cupy()
+    t0 = time.perf_counter()
+    _ = cs_predict_gpu(Basis_dev, C_dev)
+    sync_cupy()
+    cs_runs.append(time.perf_counter() - t0)
+
+t_cs_mean = np.mean(cs_runs)
+t_cs_min  = np.min(cs_runs)
+t_cs_per_point = t_cs_mean / N_TEST
+t_cs_mcmc = t_cs_per_point * T_MCMC
+
+print(f"CS  mean={t_cs_mean:.6f}s  min={t_cs_min:.6f}s  ({t_cs_per_point * 1e6:.2f} µs/point)")
+print(f"CS  estimated total MCMC time = {t_cs_mcmc:.6f}s")
+
+# ── Load DNN as single-output model ───────────────────────────────────────────
+ckpt    = torch.load(dnn_path, map_location=device)
+pmin_dn = ckpt['pmin_d']
+pmax_dn = ckpt['pmax_d']
+
+model = DNN(d, out=1).to(device)
+
+state_dict_single = slice_checkpoint_to_single_output(
+    ckpt['state_dict'],
+    output_idx=OUTPUT_IDX
+)
+model.load_state_dict(state_dict_single, strict=True)
+model.eval()
+
+xi_dnn   = canon(x_test, pmin_dn, pmax_dn).astype(np.float32)
+X_tensor = torch.from_numpy(xi_dnn).to(device)
+
+print(f"DNN: weights + inputs pre-loaded to {device}")
+print(f"DNN: using output OUTPUT_IDX={OUTPUT_IDX}")
+
+# Warm-up DNN
+with torch.no_grad():
+    _ = model(X_tensor[:5])
+sync_torch(device)
+
+# Timed runs — DNN one-output
+dnn_runs = []
+for _ in range(N_RUNS):
+    sync_torch(device)
+    t0 = time.perf_counter()
+    with torch.inference_mode():
+        _ = model(X_tensor)
+    sync_torch(device)
+    dnn_runs.append(time.perf_counter() - t0)
+
+t_dnn_mean = np.mean(dnn_runs)
+t_dnn_min  = np.min(dnn_runs)
+t_dnn_per_point = t_dnn_mean / N_TEST
+t_dnn_mcmc = t_dnn_per_point * T_MCMC
+
+print(f"DNN mean={t_dnn_mean:.6f}s  min={t_dnn_min:.6f}s  ({t_dnn_per_point * 1e6:.2f} µs/point)")
+print(f"DNN estimated total MCMC time = {t_dnn_mcmc:.6f}s")
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+ratio_wall_batch = t_dnn_mean / t_cs_mean
+ratio_wall_mcmc  = t_dnn_mcmc / t_cs_mcmc
+ratio_theory     = TOT_DNN / TOT_CS
+
+print(f"\n{'='*72}")
+print(f"  DNN vs CS SUMMARY  (d={d}, K={K}, single output)")
+print(f"{'='*72}")
+print(f"  {'':24} {'CS':>14} {'DNN':>14}")
+print(f"  {'-'*56}")
+print(f"  {'Batch time (s)':24} {t_cs_mean:>14.6f} {t_dnn_mean:>14.6f}")
+print(f"  {'µs/point':24} {t_cs_per_point*1e6:>14.2f} {t_dnn_per_point*1e6:>14.2f}")
+print(f"  {'MCMC time (s)':24} {t_cs_mcmc:>14.6f} {t_dnn_mcmc:>14.6f}")
+print(f"  {'Total ops over MCMC':24} {TOT_CS:>14,} {TOT_DNN:>14,}")
+print(f"  {'-'*56}")
+print(f"  Wall ratio (batch) DNN / CS = {ratio_wall_batch:.2f}×")
+print(f"  Wall ratio (MCMC)  DNN / CS = {ratio_wall_mcmc:.2f}×")
+print(f"  Theory ratio       DNN / CS = {ratio_theory:.2f}×")
+print(f"{'='*72}")
+
+# =============================================================================
+# PLOT (DNN vs CS, MCMC TOTAL RUNTIME + TOTAL OPS)
+# =============================================================================
+plt.rcParams.update({
+    'font.family': 'serif',
+    'font.size': 12,
+    'axes.titlesize': 14,
+    'axes.labelsize': 13,
+    'axes.linewidth': 1.0,
+    'grid.linewidth': 0.5,
+    'grid.alpha': 0.4,
+    'grid.linestyle': '--'
+})
+
+COL_DNN = '#1f77b4'
+COL_CS  = '#2ca02c'
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 6))
+
+fig.suptitle(
+    r'Inference Cost: DNN vs CS  ($d=11$, $K=1$, single output)' '\n' +
+    rf'$T_{{\rm MCMC}} = (n_{{\rm burn}} + n_{{\rm mcmc}})\times n_{{\rm walk}}'
+    rf' = ({N_BURN} + {N_MCMC})\times {N_WALK} = {T_MCMC:,}$',
+    fontsize=17, fontweight='bold', y=1.04
+)
+
+# ─────────────────────────────────────────────────────────────
+# LEFT: EXPERIMENTAL TOTAL MCMC RUNTIME
+# ─────────────────────────────────────────────────────────────
+ax = axes[0]
+
+cs_device_str = 'GPU (CuPy)' if _HAS_CUPY else 'CPU (numpy)'
+dnn_device_str = 'GPU (PyTorch CUDA)' if device.type == 'cuda' else 'CPU (PyTorch)'
+
+labels_emp = [
+    f'DNN\n{dnn_device_str}',
+    f'CS\n{cs_device_str}',
+]
+
+times_emp = [
+    t_dnn_mcmc,
+    t_cs_mcmc,
+]
+
+colors_emp = [COL_DNN, COL_CS]
+
+bars = ax.bar(
+    labels_emp,
+    times_emp,
+    color=colors_emp,
+    width=0.55,
+    edgecolor='black',
+    linewidth=1.0
+)
+
+for bar, t in zip(bars, times_emp):
+    ax.text(
+        bar.get_x() + bar.get_width()/2,
+        bar.get_height() * 1.12,
+        f'{t:.4f}s\nMCMC total',
+        ha='center',
+        va='bottom',
+        fontsize=11,
+        fontweight='bold'
+    )
+
+ax.set_yscale('log')
+ax.set_ylabel('Total wall-clock time over MCMC (seconds, log scale)')
+ax.set_title(
+    'Experimental Inference Time over MCMC\n'
+    r'Estimated as $(\mathrm{time/sample}) \times T_{\mathrm{MCMC}}$',
+    fontweight='bold'
+)
+
+ax.grid(axis='y', which='both')
+ax.set_ylim(min(times_emp) / 3, max(times_emp) * 4)
+
+# ─────────────────────────────────────────────────────────────
+# RIGHT: THEORETICAL TOTAL INFERENCE COST OVER MCMC
+# ─────────────────────────────────────────────────────────────
+ax = axes[1]
+
+labels_theory = ['DNN', 'CS']
+ops_theory = [TOT_DNN, TOT_CS]
+colors_theory = [COL_DNN, COL_CS]
+
+bars = ax.bar(
+    labels_theory,
+    ops_theory,
+    color=colors_theory,
+    width=0.55,
+    edgecolor='black',
+    linewidth=1.0
+)
+
+for bar, val in zip(bars, ops_theory):
+    ax.text(
+        bar.get_x() + bar.get_width()/2,
+        bar.get_height() * 1.10,
+        f'{val:.2e}\nops total',
+        ha='center',
+        va='bottom',
+        fontsize=11,
+        fontweight='bold'
+    )
+
+ax.set_yscale('log')
+ax.set_ylabel('Total operations over MCMC (log scale)')
+ax.set_title(
+    'Theoretical Total Inference Cost over MCMC\n'
+    r'DNN: $T_{\mathrm{MCMC}} \times C_{\mathrm{fwd}}$'
+    '\n'
+    r'CS: $T_{\mathrm{MCMC}} \times N(d)\times K$',
+    fontweight='bold'
+)
+
+ax.grid(axis='y', which='both')
+ax.set_ylim(min(ops_theory) / 3, max(ops_theory) * 4)
+
+# ─────────────────────────────────────────────────────────────
+# FINALIZE
+# ─────────────────────────────────────────────────────────────
+plt.tight_layout()
+
+out = 'inference_cost_dnn_vs_cs_mcmc_total.png'
+plt.savefig(out, dpi=200, bbox_inches='tight')
+plt.close()
+
+print(f"\nPlot saved → {out}")
