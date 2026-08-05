@@ -19,7 +19,7 @@ Incremental saving
 
 Theoretical complexity
 ----------------------
-  PDR : O(m × N(d))               N(d) = hyperbolic cross basis size
+  PDR : O(m)                       crude theory (ignores N(d) factor)
   DNN : O(m × (d×H + L×H²))      H=50 nodes, L=8 hidden layers
         L×H² = 20,000 >> d×H, so DNN time is nearly flat across d
 
@@ -420,15 +420,15 @@ def main():
                 color=c, markersize=4, linewidth=2.0, alpha=0.80,
                 label=f'DNN  d={d}')
 
-        # Theoretical curves (normalised to first data point at m=100)
-        theory_pdr  = sizes * float(N_d)
-        theory_pdr *= t_pdr[0] / theory_pdr[0]
+        # ### CHANGE: PDR crude theory only — O(m), normalised to first point
+        # Removed non-crude theory O(m·N(d)); crude theory ignores N(d) factor
+        theory_pdr_crude  = sizes * (t_pdr[0] / sizes[0])
+        ax.plot(sizes, theory_pdr_crude, ':',  color=c, linewidth=1.4, alpha=0.55)
 
+        # DNN theory — unchanged
         step_cost   = d * H + L * H ** 2       # d×50 + 8×2500
         theory_dnn  = sizes * float(step_cost)
         theory_dnn *= t_dnn[0] / theory_dnn[0]
-
-        ax.plot(sizes, theory_pdr, ':',  color=c, linewidth=1.4, alpha=0.55)
         ax.plot(sizes, theory_dnn, '-.', color=c, linewidth=1.1, alpha=0.45)
 
     # Dual legend
@@ -437,8 +437,9 @@ def main():
                label='PDR — actual'),
         Line2D([0],[0], color='k', ls='--', marker='s', ms=5, lw=2.0, alpha=0.8,
                label='DNN — actual'),
+        # ### CHANGE: label updated to reflect crude O(m) theory for PDR
         Line2D([0],[0], color='k', ls=':',  lw=1.6, alpha=0.7,
-               label=r'PDR theory  $\mathcal{O}(m \cdot N(d))$'),
+               label=r'PDR crude theory  $\mathcal{O}(m)$'),
         Line2D([0],[0], color='k', ls='-.', lw=1.3, alpha=0.7,
                label=r'DNN theory  $\mathcal{O}(m \cdot (dH + LH^2))$'),
     ]
@@ -460,7 +461,8 @@ def main():
     ax.set_ylabel('Wall-clock Training Time  (seconds)', fontsize=13)
     ax.set_title(
         'Scalability: PDR vs DNN (GPU)  —  Varying Dimension and Training Size\n'
-        r'Dotted: PDR $\mathcal{O}(m \cdot N(d))$  |  '
+        # ### CHANGE: title updated to reflect crude O(m) for PDR
+        r'Dotted: PDR crude $\mathcal{O}(m)$  |  '
         r'Dash-dot: DNN $\mathcal{O}(m \cdot (dH + LH^2))$',
         fontsize=12
     )
