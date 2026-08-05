@@ -1,4 +1,4 @@
-# mcmc_with_dnn_updated.py
+# mcmc_with_pdr11d.py
 import os, time
 import numpy as np
 import xarray as xr
@@ -11,34 +11,22 @@ from surrogate_config_11d import (
     set_global_seed, SEED,
     XNAMES, X_TRUE_11D, PMIN_11, PMAX_11,
     Y_SIG_SIX, YMASK_FIG7, YMASK_FIG9,
+    TRUE_CHAIN_FILE_NORAD, TRUE_CHAIN_FILE_RAD,
     MCMC_NWALK, MCMC_NBURN, MCMC_NMCMC,
 )
+
 from crm_eval_11d_six import run_cloud_11d_six
-import log_prob_dnn11d
+import log_prob_pdr11d
 
 # ------------------------------------------------------------------
-#  PATHS TO CLOUD MCMC "TRUE" POSTERIOR CHAINS (11D full CRM)
+#  Cloud MCMC true posterior paths are imported from surrogate_config_11d.py
 # ------------------------------------------------------------------
-TRUE_CHAIN_FILE_NORAD = "/home/ss24ce/last_time-2/FINAL_CRM11D_20260216_140339/output/mcmc_crm1d__EXP_3_full11_ag400.00000_bg0.40000_norad.nc"
-TRUE_CHAIN_FILE_RAD   = "/home/ss24ce/last_time-2/FINAL_CRM11D_20260222_044235/output/mcmc_crm1d__EXP_3_full11_ag400.00000_bg0.40000_rad.nc"
 
-# ==============================================================
-#   SINGLE RUN OUTPUT FOLDER (chain / diagnostics)  +  KDE FIG FOLDER
-# ==============================================================
-RUN_ID = time.strftime("%Y%m%d_%H%M%S")
-OUT_ROOT = os.path.join("runs", f"run_{RUN_ID}")
-
-DIR_OUTPUT = os.path.join(OUT_ROOT, "output")
-DIR_PLOTS  = os.path.join(OUT_ROOT, "plots")
-DIR_MCMC   = os.path.join(OUT_ROOT, "mcmc__DNN")
-
-os.makedirs(DIR_OUTPUT, exist_ok=True)
-os.makedirs(DIR_PLOTS,  exist_ok=True)
-os.makedirs(DIR_MCMC,   exist_ok=True)
-
-# KDE figures (ag-bg marginal + 11x11 pairwise grid) go here, as requested
-DNN_FIG_DIR = "DNN_updated_figures_mcmc"
-os.makedirs(DNN_FIG_DIR, exist_ok=True)
+# KDE figures (ag-bg marginal + 11x11 pairwise grid) go here, mirroring the
+# DNN script's DNN_updated_figures_mcmc/ folder.
+PDR_FIG_DIR = "PDR_updated_figures_mcmc"
+os.makedirs(PDR_FIG_DIR, exist_ok=True)
+print(f"[INFO] Saving KDE figures under: {os.path.abspath(PDR_FIG_DIR)}")
 
 # Subsample cap for the KDE figures only (match the standalone Cloud script).
 # The full flattened chain is nsteps*nwalkers (e.g. 400000*32 ~ 12.8M),
@@ -47,21 +35,16 @@ os.makedirs(DNN_FIG_DIR, exist_ok=True)
 MAX_SAMPLES = 400000
 SUBSAMPLE_SEED = 0
 
-print(f"[INFO] Saving run outputs under: {os.path.abspath(OUT_ROOT)}")
-print(f"[INFO] Saving KDE figures under: {os.path.abspath(DNN_FIG_DIR)}")
-
-# ==============================================================
-#   NUMERICAL INTEGRATION (SciPy old/new compatible)
-# ==============================================================
+# simps fallback -- SciPy old/new compatible, always use x= keyword
 try:
-    from scipy.integrate import simps as _scipy_simps  # old SciPy
+    from scipy.integrate import simps as _scipy_simps
 
     def simps(y, x=None, axis=-1):
         return _scipy_simps(y, x=x, axis=axis)
 
 except Exception:
     try:
-        from scipy.integrate import simpson as _scipy_simpson  # new SciPy
+        from scipy.integrate import simpson as _scipy_simpson
 
         def simps(y, x=None, axis=-1):
             return _scipy_simpson(y, x=x, axis=axis)
@@ -72,74 +55,9 @@ except Exception:
         def simps(y, x=None, axis=-1):
             return _np.trapz(y, x=x, axis=axis)
 
-# ==============================================================
-#   SAVE / NETCDF SAFETY HELPERS
-# ==============================================================
-def _ensure_writable_dir(path: str):
-    d = os.path.dirname(path) or "."
-    os.makedirs(d, exist_ok=True)
-    test_path = os.path.join(d, ".__write_test__")
-    with open(test_path, "w") as f:
-        f.write("ok")
-    os.remove(test_path)
-
-def _safe_float(arr, dtype=np.float32, nan_fill=-1e30):
-    """Force numeric dtype and remove NaN/Inf."""
-    a = np.asarray(arr)
-    if a.dtype == object:
-        a = np.array(a.tolist(), dtype=np.float64)
-    a = a.astype(dtype, copy=False)
-    a = np.nan_to_num(a, nan=nan_fill, posinf=1e30, neginf=-1e30)
-    return a
-
-def save_dataset_safely(ds: xr.Dataset, out_nc: str, debug_one_by_one: bool = False):
-    _ensure_writable_dir(out_nc)
-
-    if os.path.exists(out_nc):
-        os.remove(out_nc)
-
-    if debug_one_by_one:
-        print("\n[DEBUG] Writing variables one-by-one to locate failure...")
-        for v in list(ds.data_vars):
-            try:
-                tmp = xr.Dataset({v: ds[v]}, coords=ds.coords, attrs=ds.attrs)
-                tmp_path = out_nc.replace(".nc", f".__test_{v}.nc")
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-                tmp.to_netcdf(tmp_path, engine="netcdf4", format="NETCDF4")
-                print("  OK:", v, "dtype=", tmp[v].dtype, "shape=", tmp[v].shape)
-            except Exception as e:
-                print("  FAIL:", v, "dtype=", ds[v].dtype, "shape=", ds[v].shape)
-                print("       error:", repr(e))
-                raise
-        print("[DEBUG] All per-variable writes succeeded. Problem may be multi-var close step.\n")
-
-    encoding = {}
-    for v in ds.data_vars:
-        enc = {"zlib": True, "complevel": 4}
-        if ds[v].ndim == 3:
-            enc["chunksizes"] = (min(2000, ds[v].shape[0]), ds[v].shape[1], ds[v].shape[2])
-        elif ds[v].ndim == 2:
-            enc["chunksizes"] = (min(4000, ds[v].shape[0]), ds[v].shape[1])
-        encoding[v] = enc
-
-    try:
-        ds.to_netcdf(out_nc, engine="netcdf4", format="NETCDF4", encoding=encoding)
-        print("Saved:", out_nc)
-        return
-    except Exception as e1:
-        print("[WARN] netcdf4 write failed:", repr(e1))
-
-    try:
-        ds.to_netcdf(out_nc, engine="h5netcdf")
-        print("Saved with h5netcdf:", out_nc)
-        return
-    except Exception as e2:
-        print("[ERROR] h5netcdf fallback also failed:", repr(e2))
-        raise
 
 # ==============================================================
-#   KDE PLOTTING  (identical body to the Cloud script so the figures match)
+#   KDE PLOTTING  (identical body to the Cloud and DNN scripts)
 # ==============================================================
 def kde1d(x, grid, bw=0.15):
     kde = gaussian_kde(x, bw_method=bw)
@@ -278,6 +196,7 @@ def plot_pairwise_grid(Xa_plot, xnames, pmin, pmax, x_true,
     plt.close(fig)
     print("Saved:", os.path.abspath(out_png))
 
+
 # ==============================================================
 #   JS DIVERGENCE HELPERS
 # ==============================================================
@@ -290,6 +209,7 @@ def kullback_leibler_divergence(P, Q):
 def jensen_shannon_divergence(P, Q):
     M = 0.5 * (P + Q)
     return 0.5 * kullback_leibler_divergence(P, M) + 0.5 * kullback_leibler_divergence(Q, M)
+
 
 # ==============================================================
 #   ENERGY DISTANCE HELPERS
@@ -333,13 +253,13 @@ def fixed_subsample(X, max_n=5000, seed=None):
     idx = rng.choice(n, size=max_n, replace=False)
     return X[idx].copy()
 
-def compute_pairwise_ed_matrix(X_dnn, X_true, xnames, max_n=2000, seed_base=None):
+def compute_pairwise_ed_matrix(X_pdr, X_true, xnames, max_n=2000, seed_base=None):
     """
     Pairwise 2D Energy Distance for every unique parameter pair.
       - lower triangle only, then mirrored (ED is symmetric)
       - deterministic per-pair seeds when seed_base is provided
     """
-    X_dnn = np.asarray(X_dnn, dtype=float)
+    X_pdr = np.asarray(X_pdr, dtype=float)
     X_true = np.asarray(X_true, dtype=float)
 
     d = len(xnames)
@@ -347,7 +267,7 @@ def compute_pairwise_ed_matrix(X_dnn, X_true, xnames, max_n=2000, seed_base=None
 
     for i in range(d):
         for j in range(i):
-            Xp = X_dnn[:, [j, i]]
+            Xp = X_pdr[:, [j, i]]
             Xt = X_true[:, [j, i]]
 
             seed_ij = None if seed_base is None else seed_base + i * d + j
@@ -433,9 +353,9 @@ def plot_pairwise_ed_ranking(ED_mat, labels, out_png,
     plt.close(fig)
     print("Saved ED ranking plot:", os.path.abspath(out_png))
 
-def compute_pairwise_js_matrix(X_dnn, X_true, xnames, pmin, pmax,
+def compute_pairwise_js_matrix(X_pdr, X_true, xnames, pmin, pmax,
                                n_grid=80, bw_2d=0.2):
-    X_dnn = np.asarray(X_dnn, dtype=float)
+    X_pdr = np.asarray(X_pdr, dtype=float)
     X_true = np.asarray(X_true, dtype=float)
     d = len(xnames)
     JS_mat = np.zeros((d, d), dtype=float)
@@ -444,7 +364,7 @@ def compute_pairwise_js_matrix(X_dnn, X_true, xnames, pmin, pmax,
     # the same 2D marginal -> compute the lower triangle once and mirror it.
     for i in range(d):
         for j in range(i):
-            Xp = X_dnn[:, [i, j]]
+            Xp = X_pdr[:, [i, j]]
             Xt = X_true[:, [i, j]]
 
             x_all = np.concatenate([Xp[:, 0], Xt[:, 0]])
@@ -465,6 +385,7 @@ def compute_pairwise_js_matrix(X_dnn, X_true, xnames, pmin, pmax,
             JS_mat[j, i] = js
 
     return JS_mat
+
 
 # ==============================================================
 #   HEATMAP PLOTTING FOR ED / JS MATRICES
@@ -493,45 +414,11 @@ def plot_matrix_heatmap(M, labels, title, out_png, cmap='Blues', fmt="{:.2f}"):
     plt.savefig(out_png, dpi=150, bbox_inches='tight')
     plt.close(fig)
 
-# ==============================================================
-#   DIAGNOSTIC HELPERS (R-hat + trace plots)
-# ==============================================================
-def gelman_rubin_rhat(chains_3d: np.ndarray):
-    nsteps, nwalkers, nparams = chains_3d.shape
-    rhat = np.empty(nparams, dtype=float)
-    for k in range(nparams):
-        x = chains_3d[:, :, k]
-        n = float(nsteps)
-        chain_means = np.mean(x, axis=0)
-        chain_vars  = np.var(x, axis=0, ddof=1)
-        B = n * np.var(chain_means, ddof=1)
-        W = np.mean(chain_vars)
-        Var_hat = ((n - 1.0) / n) * W + (B / n)
-        rhat[k] = np.sqrt(Var_hat / W)
-    return rhat
-
-def plot_traces(Xa, param_names, out_png):
-    nsteps, nwalkers, nparams = Xa.shape
-    fig, axes = plt.subplots(nparams, 1, figsize=(10, 2.0*nparams), sharex=True)
-    if nparams == 1:
-        axes = [axes]
-    for k in range(nparams):
-        ax = axes[k]
-        ax.plot(Xa[:, :, k], alpha=0.3)
-        ax.set_ylabel(param_names[k])
-        ax.grid(alpha=0.2)
-    axes[-1].set_xlabel("MCMC step")
-    fig.suptitle("Trace plots (DNN 11D, all walkers)", y=0.99, fontsize=14)
-    plt.tight_layout(rect=[0, 0, 1, 0.97])
-    os.makedirs(os.path.dirname(out_png) or '.', exist_ok=True)
-    plt.savefig(out_png, dpi=130, bbox_inches="tight")
-    plt.close(fig)
-    print("Saved trace plots:", os.path.abspath(out_png))
 
 # ==============================================================
 #   TRUE POSTERIOR SAMPLING (FROM CLOUD MCMC CHAIN)
 # ==============================================================
-def sample_true_from_cloud_chain(nc_path, nsamples=5000):
+def sample_true_from_cloud_chain(nc_path, nsamples=4000):
     if not os.path.exists(nc_path):
         raise FileNotFoundError(f"Cloud MCMC file not found: {nc_path}")
     ds = xr.open_dataset(nc_path)
@@ -548,7 +435,7 @@ def sample_true_from_cloud_chain(nc_path, nsamples=5000):
     idx = rng.choice(M, size=ns, replace=False)
     return pts[idx, :]
 
-def subsample_cloud(X, max_n=5000, seed=None):
+def subsample_cloud(X, max_n=4000, seed=None):
     X = np.asarray(X, dtype=float)
     n = X.shape[0]
     if n <= max_n:
@@ -557,88 +444,36 @@ def subsample_cloud(X, max_n=5000, seed=None):
     idx = rng.choice(n, size=max_n, replace=False)
     return X[idx, :]
 
-# ==============================================================
-#   TIMING PLOT HELPER
-# ==============================================================
-def plot_mcmc_timing(timing_dict: dict, out_png: str):
-    label       = timing_dict['run_note'].replace('_', '').upper()
-    total_s     = timing_dict['total_time_s']
-    total_h     = total_s / 3600.0
-    per_step_ms = timing_dict['per_step_time_ms']
-    nwalk       = timing_dict['nwalk']
-    nmcmc       = timing_dict['nmcmc']
-
-    fig, axes = plt.subplots(1, 2, figsize=(10, 5), facecolor='white')
-
-    ax = axes[0]
-    bar = ax.bar(['Total\n400K steps'], [total_s], color='steelblue',
-                 width=0.4, edgecolor='black', linewidth=0.8)
-    ax.bar_label(bar, labels=[f"{total_s:.1f} s\n({total_h:.2f} h)"],
-                 padding=6, fontsize=11, fontweight='bold')
-    ax.set_ylabel("Wall-clock time (seconds)", fontsize=12)
-    ax.set_title(f"Total MCMC time\n({nmcmc:,} steps, {nwalk} walkers, {label})",
-                 fontsize=12)
-    ax.set_ylim(0, total_s * 1.25)
-    ax.yaxis.grid(True, alpha=0.3)
-    ax.set_axisbelow(True)
-
-    ax2 = axes[1]
-    bar2 = ax2.bar(['Per MCMC\nstep'], [per_step_ms], color='darkorange',
-                   width=0.4, edgecolor='black', linewidth=0.8)
-    ax2.bar_label(bar2, labels=[f"{per_step_ms:.3f} ms"],
-                  padding=6, fontsize=11, fontweight='bold')
-    ax2.set_ylabel("Wall-clock time (milliseconds)", fontsize=12)
-    ax2.set_title(f"Per-step MCMC time\n(1 step = 1 ensemble proposal, {label})",
-                  fontsize=12)
-    ax2.set_ylim(0, per_step_ms * 1.25)
-    ax2.yaxis.grid(True, alpha=0.3)
-    ax2.set_axisbelow(True)
-
-    fig.suptitle("DNN Surrogate MCMC - Computational Timing", fontsize=14,
-                 fontweight='bold', y=1.01)
-    plt.tight_layout()
-    os.makedirs(os.path.dirname(out_png) or '.', exist_ok=True)
-    plt.savefig(out_png, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"Saved timing plot: {os.path.abspath(out_png)}")
-
-def save_timing_txt(timing_dict: dict, out_txt: str):
-    os.makedirs(os.path.dirname(out_txt) or '.', exist_ok=True)
-    with open(out_txt, 'w') as f:
-        f.write("=== DNN MCMC Timing Summary ===\n")
-        f.write(f"Case                  : {timing_dict['run_note']}\n")
-        f.write(f"Walkers               : {timing_dict['nwalk']}\n")
-        f.write(f"Production steps      : {timing_dict['nmcmc']:,}\n")
-        f.write(f"Total production time : {timing_dict['total_time_s']:.2f} s  "
-                f"({timing_dict['total_time_s']/3600:.4f} h)\n")
-        f.write(f"Per-step time         : {timing_dict['per_step_time_ms']:.4f} ms\n")
-    print(f"Saved timing summary : {os.path.abspath(out_txt)}")
 
 # ==============================================================
-#   MAIN DNN MCMC + METRIC COMPUTATION
+#   MAIN PDR MCMC + METRIC COMPUTATION
 # ==============================================================
 def run_case(USE_RADIATION: bool):
     set_global_seed(SEED)
     x_true = X_TRUE_11D.copy()
-    PMask  = np.ones_like(x_true)
+    PMask = np.ones_like(x_true)
 
-    y_mask   = YMASK_FIG9 if USE_RADIATION else YMASK_FIG7
+    y_mask = YMASK_FIG9 if USE_RADIATION else YMASK_FIG7
     run_note = "_rad" if USE_RADIATION else "_norad"
+    title_note = "(with radiation: OLR, OSR)" if USE_RADIATION else "(no radiation: PCP, LWP, IWP)"
 
+    # truth for all 6 @120
     L1_six = run_cloud_11d_six(x_true[None, :])[0]
 
+    # MCMC knobs from surrogate_config_11d.py
     nwalk = MCMC_NWALK
     nburn = MCMC_NBURN
     nmcmc = MCMC_NMCMC
-    print(f"[INFO] MCMC settings from config: nwalk={nwalk}, nburn={nburn}, nmcmc={nmcmc}")
 
+    print(f"[INFO] MCMC settings from config: nwalk={nwalk}, nburn={nburn}, nmcmc={nmcmc}")
     x_sig = np.array([20.0, 0.05, 20.0, 0.05,
                       0.05, 0.05, 0.05,
                       0.05, 0.05,
                       1.e-4, 1.e-5])
 
+    # init walkers inside bounds
     p0 = np.tile(x_true, nwalk).reshape((nwalk, 11)) + \
-         np.random.normal(0.0, 1.0, (nwalk, 11)) * x_sig
+        np.random.normal(0.0, 1.0, (nwalk, 11)) * x_sig
     for j in range(11):
         lo, hi = PMIN_11[j], PMAX_11[j]
         bad = (p0[:, j] < lo) | (p0[:, j] > hi)
@@ -646,133 +481,68 @@ def run_case(USE_RADIATION: bool):
             p0[bad, j] = x_true[j] + np.random.normal(0.0, x_sig[j], bad.sum())
             bad = (p0[:, j] < lo) | (p0[:, j] > hi)
 
-    lp0, _ = log_prob_dnn11d.log_prob_dnn11d(
-        p0[0], x_true, L1_six, Y_SIG_SIX,
-        PMIN_11, PMAX_11, PMask, y_mask, 1
+    # sanity (vectorized log_prob returns a length-nw list of (lp, blob))
+    res0 = log_prob_pdr11d.log_prob_pdr11d(
+        p0[:1], x_true, L1_six, Y_SIG_SIX, PMIN_11, PMAX_11, PMask, y_mask
     )
+    lp0 = res0[0][0]
     if not np.isfinite(lp0):
-        raise RuntimeError("Initial DNN log_prob is -inf; train DNN first.")
+        raise RuntimeError("Initial PDR log_prob is -inf; train PDR first.")
 
-    dtype = [("Hx", float, (1+6,))]
+    dtype = [("Hx", float, (1 + 6,))]
     sampler = emcee.EnsembleSampler(
-        nwalk, 11, log_prob_dnn11d.log_prob_dnn11d,
+        nwalk, 11, log_prob_pdr11d.log_prob_pdr11d,
         blobs_dtype=dtype,
-        args=[x_true, L1_six, Y_SIG_SIX,
-              PMIN_11, PMAX_11, PMask, y_mask, 1]
+        vectorize=True,   # batched: predict() runs once per step, not per walker
+        args=[x_true, L1_six, Y_SIG_SIX, PMIN_11, PMAX_11, PMask, y_mask, 1]
     )
 
     t0 = time.time()
     state = sampler.run_mcmc(p0, nburn, progress=True)
     sampler.reset()
-    t_prod_start = time.time()
     sampler.run_mcmc(state, nmcmc, progress=True)
-    t_prod_end   = time.time()
-    total_prod_time_s  = t_prod_end - t_prod_start
-    per_step_time_ms   = (total_prod_time_s / nmcmc) * 1e3
-    print(f"DNN MCMC {run_note} took {time.time()-t0:.1f}s")
+    print(f"PDR MCMC {run_note} took {time.time() - t0:.1f}s")
 
-    print(f"\n=== MCMC TIMING ({run_note}) ===")
-    print(f"  Production steps      : {nmcmc:,}")
-    print(f"  Total production time : {total_prod_time_s:.2f} s  "
-          f"({total_prod_time_s/3600:.4f} h)")
-    print(f"  Per-step time         : {per_step_time_ms:.4f} ms")
-    print("================================\n")
-
-    timing_dict = {
-        'run_note'         : run_note,
-        'nwalk'            : nwalk,
-        'nmcmc'            : nmcmc,
-        'total_time_s'     : total_prod_time_s,
-        'per_step_time_ms' : per_step_time_ms,
-    }
-
-    timing_png = os.path.join(DIR_MCMC, f"fig_timing_dnn11d{run_note}.png")
-    timing_txt = os.path.join(DIR_MCMC, f"timing_dnn11d{run_note}.txt")
-    plot_mcmc_timing(timing_dict, timing_png)
-    save_timing_txt(timing_dict,  timing_txt)
-
-    Xa      = sampler.get_chain()
+    Xa = sampler.get_chain()
     log_pxy = sampler.get_log_prob()
+    blobs = sampler.get_blobs()["Hx"]
+    log_pyx = blobs[:, :, 0]
+    HXa = blobs[:, :, 1:]
 
-    b = sampler.get_blobs()
-    try:
-        Hx_struct = b["Hx"]
-    except Exception:
-        Hx_struct = b
-
-    Hx_struct = np.asarray(Hx_struct)
-    if Hx_struct.dtype == object:
-        Hx_struct = np.array(Hx_struct.tolist(), dtype=np.float64)
-
-    log_pyx = np.asarray(Hx_struct[:, :, 0])
-    HXa     = np.asarray(Hx_struct[:, :, 1:])
-
-    acc = float(np.mean(sampler.acceptance_fraction))
-    print(f"Mean acceptance (DNN{run_note}): {acc:.3f}")
-
-    try:
-        tau_arr = sampler.get_autocorr_time(quiet=True)
-        print("Autocorr times (per parameter, DNN):", tau_arr)
-    except Exception as e:
-        print("Autocorr time computation failed (DNN):", repr(e))
-        tau_arr = None
-
-    try:
-        rhat = gelman_rubin_rhat(Xa)
-        print("Gelman-Rubin R-hat (per parameter, DNN):", rhat)
-    except Exception as e:
-        print("R-hat computation failed (DNN):", repr(e))
-        rhat = None
-
-    trace_png = os.path.join(DIR_PLOTS, f"trace_dnn11d{run_note}.png")
-    plot_traces(Xa, XNAMES, trace_png)
-
-    Xa_s      = _safe_float(Xa, dtype=np.float32)
-    HXa_s     = _safe_float(HXa, dtype=np.float32)
-    log_pxy_s = _safe_float(log_pxy, dtype=np.float32)
-    log_pyx_s = _safe_float(log_pyx, dtype=np.float32)
-
-    x_true_s  = _safe_float(x_true, dtype=np.float32)
-    PMask_s   = _safe_float(PMask.astype(float), dtype=np.float32)
-    L1_six_s  = _safe_float(L1_six, dtype=np.float32)
-    L2_six_s  = _safe_float((Y_SIG_SIX**2), dtype=np.float32)
-    y_mask_s  = _safe_float(y_mask.astype(float), dtype=np.float32)
-
-    base = f"_EXP_3_dnn11d{run_note}.nc"
-    out_nc = os.path.join(DIR_OUTPUT, base)
-
+    os.makedirs('output', exist_ok=True)
+    base = f'_EXP_3_pdr11d{run_note}.nc'
     ds = xr.Dataset(
-        {"x_true":  (["nx"], x_true_s),
-         "PMask":   (["nx"], PMask_s),
-         "L1_six":  (["ny"], L1_six_s),
-         "L2_six":  (["ny"], L2_six_s),
-         "y_mask":  (["ny"], y_mask_s),
-         "Xa":      (["nsamples","nchains","nx"], Xa_s),
-         "HXa":     (["nsamples","nchains","ny"], HXa_s),
-         "p_yx":    (["nsamples","nchains"], log_pyx_s),
-         "p_xy":    (["nsamples","nchains"], log_pxy_s)},
-        coords={"nsamples": np.arange(Xa_s.shape[0]),
-                "nchains":  np.arange(Xa_s.shape[1]),
-                "nx":       np.arange(11),
-                "ny":       np.arange(6)},
-        attrs={"xnames": ",".join(XNAMES),
-               "ynames": "PCP@120,ACC@120,LWP@120,IWP@120,OLR@120,OSR@120",
-               "Acceptance fraction": float(np.mean(sampler.acceptance_fraction)),
-               "MCMC_total_prod_time_s"  : float(total_prod_time_s),
-               "MCMC_per_step_time_ms"   : float(per_step_time_ms),
-               "MCMC_nmcmc_steps"        : int(nmcmc)}
+        {
+            "x_true": (["nx"], x_true),
+            "PMask": (["nx"], PMask.astype(float)),
+            "L1_six": (["ny"], L1_six),
+            "L2_six": (["ny"], (Y_SIG_SIX ** 2)),  # sigma^2 saved
+            "y_mask": (["ny"], y_mask.astype(float)),
+            "Xa": (["nsamples", "nchains", "nx"], Xa),
+            "HXa": (["nsamples", "nchains", "ny"], HXa),
+            "p_yx": (["nsamples", "nchains"], log_pyx),
+            "p_xy": (["nsamples", "nchains"], log_pxy),
+        },
+        coords={
+            "nsamples": np.arange(Xa.shape[0]),
+            "nchains": np.arange(Xa.shape[1]),
+            "nx": np.arange(11),
+            "ny": np.arange(6),
+        },
+        attrs={
+            "xnames": ",".join(XNAMES),
+            "ynames": "PCP@120,ACC@120,LWP@120,IWP@120,OLR@120,OSR@120",
+            "Acceptance fraction": float(np.mean(sampler.acceptance_fraction)),
+        },
     )
+    out_nc = os.path.join('output', base)
+    ds.to_netcdf(out_nc)
+    print("Saved:", out_nc)
 
-    if tau_arr is not None:
-        ds["tau"] = (["nx"], _safe_float(tau_arr, dtype=np.float32))
-        ds.tau.attrs["long_name"] = "Autocorrelation time per parameter (DNN 11D)"
-    if rhat is not None:
-        ds["rhat"] = (["nx"], _safe_float(rhat, dtype=np.float32))
-        ds.rhat.attrs["long_name"] = "Gelman-Rubin R-hat per parameter (DNN 11D)"
-
-    save_dataset_safely(ds, out_nc, debug_one_by_one=False)
-
-    Xa_plot = Xa_s.reshape(-1, Xa_s.shape[-1])   # full chain (ED/JS below use this)
+    # -----------------------------
+    #   KDE FIGURES -> PDR_FIG_DIR (identical style to the DNN script)
+    # -----------------------------
+    Xa_plot = Xa.reshape(-1, Xa.shape[-1])   # full chain (ED/JS below use this)
 
     # Cap the sample count fed to the KDE figures (matches the Cloud pairgrid
     # script's MAX_SAMPLES). ED/JS pools further down still use the full Xa_plot.
@@ -780,16 +550,16 @@ def run_case(USE_RADIATION: bool):
                    if MAX_SAMPLES is not None else Xa_plot)
     print(f"[INFO] KDE figures use {Xa_plot_kde.shape[0]:,} of {Xa_plot.shape[0]:,} samples")
 
-    # ---- KDE figures -> DNN_FIG_DIR (identical style to the Cloud script) ----
     plot_ag_bg_marginal(
         Xa_plot_kde, XNAMES, PMIN_11, PMAX_11, x_true,
-        out_png=os.path.join(DNN_FIG_DIR, f"fig_agbg_marginal{base.replace('.nc','.png')}"),
-        title_note=f"(DNN 11D; {'OLR/OSR' if y_mask[-2:].sum() else 'PCP/LWP/IWP'})"
+        out_png=os.path.join(PDR_FIG_DIR, f"fig_agbg_marginal{base.replace('.nc', '.png')}"),
+        title_note=f"(PDR 11D; {'OLR/OSR' if y_mask[-2:].sum() else 'PCP/LWP/IWP'})"
     )
+
     plot_pairwise_grid(
         Xa_plot_kde, XNAMES, PMIN_11, PMAX_11, x_true,
-        out_png=os.path.join(DNN_FIG_DIR, f"fig_pairgrid{base.replace('.nc','.png')}"),
-        title=f"DNN 11D pairwise marginals {'(with rad)' if y_mask[-2:].sum() else '(no rad)'}"
+        out_png=os.path.join(PDR_FIG_DIR, f"fig_pairgrid{base.replace('.nc', '.png')}"),
+        title=f"PDR 11D pairwise marginals {'(with rad)' if y_mask[-2:].sum() else '(no rad)'}"
     )
 
     # ---- DEEP-DIVE: (as, bs) and (ag, bg) close-up pairwise structure ----
@@ -805,27 +575,29 @@ def run_case(USE_RADIATION: bool):
     plot_pairwise_grid(
         Xa_plot_kde, XNAMES, PMIN_11, PMAX_11, x_true,
         subset=['as', 'bs', 'ag', 'bg'],
-        out_png=os.path.join(DNN_FIG_DIR, f"fig_pairgrid_snowgraupel4x4{base.replace('.nc','.png')}"),
-        title=f"DNN 11D deep-dive: (as,bs) & (ag,bg) incl. cross pairs ({rad_tag})"
+        out_png=os.path.join(PDR_FIG_DIR, f"fig_pairgrid_snowgraupel4x4{base.replace('.nc','.png')}"),
+        title=f"PDR 11D deep-dive: (as,bs) & (ag,bg) incl. cross pairs ({rad_tag})"
     )
 
     # (2) Standalone 2x2 grid: as, bs only (snow fallspeed-diameter pair)
     plot_pairwise_grid(
         Xa_plot_kde, XNAMES, PMIN_11, PMAX_11, x_true,
         subset=['as', 'bs'],
-        out_png=os.path.join(DNN_FIG_DIR, f"fig_pairgrid_as_bs{base.replace('.nc','.png')}"),
-        title=f"DNN 11D deep-dive: (as, bs) snow fallspeed-diameter ({rad_tag})"
+        out_png=os.path.join(PDR_FIG_DIR, f"fig_pairgrid_as_bs{base.replace('.nc','.png')}"),
+        title=f"PDR 11D deep-dive: (as, bs) snow fallspeed-diameter ({rad_tag})"
     )
 
     # (3) Standalone 2x2 grid: ag, bg only (graupel fallspeed-diameter pair)
     plot_pairwise_grid(
         Xa_plot_kde, XNAMES, PMIN_11, PMAX_11, x_true,
         subset=['ag', 'bg'],
-        out_png=os.path.join(DNN_FIG_DIR, f"fig_pairgrid_ag_bg{base.replace('.nc','.png')}"),
-        title=f"DNN 11D deep-dive: (ag, bg) graupel fallspeed-diameter ({rad_tag})"
+        out_png=os.path.join(PDR_FIG_DIR, f"fig_pairgrid_ag_bg{base.replace('.nc','.png')}"),
+        title=f"PDR 11D deep-dive: (ag, bg) graupel fallspeed-diameter ({rad_tag})"
     )
 
-    # ---- ED / JS metrics vs Cloud 'true' posterior ----
+    # ==========================================================
+    #   JS + ENERGY DISTANCE vs CLOUD MCMC (TRUE)  -> mcmc__PDR/
+    # ==========================================================
     true_chain_file = TRUE_CHAIN_FILE_RAD if USE_RADIATION else TRUE_CHAIN_FILE_NORAD
     if not os.path.exists(true_chain_file):
         print("[WARN] Cloud MCMC 'true' chain not found -> skipping ED/JS metrics:")
@@ -833,67 +605,69 @@ def run_case(USE_RADIATION: bool):
         return
 
     try:
+        os.makedirs("mcmc__PDR", exist_ok=True)
+
         # ED validation -- deterministic fixed subsets
-        X_dnn_pool = subsample_cloud(Xa_plot, max_n=10000, seed=SEED + 301)
+        X_pdr_pool = subsample_cloud(Xa_plot, max_n=10000, seed=SEED + 101)
         X_true_pool = sample_true_from_cloud_chain(true_chain_file, nsamples=10000)
 
         ED_MAX_N_SCALAR = 5000
         ED_MAX_N_PAIRWISE = 2000
 
-        Xd = fixed_subsample(X_dnn_pool, max_n=ED_MAX_N_SCALAR, seed=SEED + 304)
-        Xt = fixed_subsample(X_true_pool, max_n=ED_MAX_N_SCALAR, seed=SEED + 305)
+        Xp = fixed_subsample(X_pdr_pool, max_n=ED_MAX_N_SCALAR, seed=SEED + 203)
+        Xt = fixed_subsample(X_true_pool, max_n=ED_MAX_N_SCALAR, seed=SEED + 204)
 
-        ED_self_dnn, _ = energy_distance(Xd, Xd, max_n=ED_MAX_N_SCALAR, seed=None)
+        ED_self_pdr, _ = energy_distance(Xp, Xp, max_n=ED_MAX_N_SCALAR, seed=None)
         ED_self_true, _ = energy_distance(Xt, Xt, max_n=ED_MAX_N_SCALAR, seed=None)
-        ED_dnn_true, _ = energy_distance(Xd, Xt, max_n=ED_MAX_N_SCALAR, seed=None)
-        ED_true_dnn, _ = energy_distance(Xt, Xd, max_n=ED_MAX_N_SCALAR, seed=None)
+        ED_pdr_true, _ = energy_distance(Xp, Xt, max_n=ED_MAX_N_SCALAR, seed=None)
+        ED_true_pdr, _ = energy_distance(Xt, Xp, max_n=ED_MAX_N_SCALAR, seed=None)
 
-        print("\n=== ENERGY DISTANCE VALIDATION TESTS (DNN vs Cloud MCMC) ===")
-        print(f"Exact self-distance (DNN vs same DNN):       ED = {ED_self_dnn:.6e}")
+        print("\n=== ENERGY DISTANCE VALIDATION TESTS (PDR vs Cloud MCMC) ===")
+        print(f"Exact self-distance (PDR vs same PDR):       ED = {ED_self_pdr:.6e}")
         print(f"Exact self-distance (Cloud vs same Cloud):   ED = {ED_self_true:.6e}")
-        print(f"ED(DNN, Cloud):                              ED = {ED_dnn_true:.6f}")
-        print(f"ED(Cloud, DNN):                              ED = {ED_true_dnn:.6f}")
-        print(f"Symmetry difference:                         {abs(ED_dnn_true - ED_true_dnn):.6e}")
+        print(f"ED(PDR, Cloud):                              ED = {ED_pdr_true:.6f}")
+        print(f"ED(Cloud, PDR):                              ED = {ED_true_pdr:.6f}")
+        print(f"Symmetry difference:                         {abs(ED_pdr_true - ED_true_pdr):.6e}")
         print("=== END VALIDATION TESTS ===\n")
 
         ED_mat = compute_pairwise_ed_matrix(
-            X_dnn_pool, X_true_pool, XNAMES,
-            max_n=ED_MAX_N_PAIRWISE, seed_base=SEED + 400
+            X_pdr_pool, X_true_pool, XNAMES,
+            max_n=ED_MAX_N_PAIRWISE, seed_base=SEED + 500
         )
 
-        ed_heat_png = os.path.join(DIR_MCMC, f"fig_EDmatrix_dnn11d{run_note}.png")
+        ed_heat_png = os.path.join("mcmc__PDR", f"fig_EDmatrix_pdr11d{run_note}.png")
         plot_pairwise_ed_heatmap(
             ED_mat, XNAMES, out_png=ed_heat_png,
-            title=f"Energy distance (pairwise)\nDNN vs Cloud {run_note}", fmt="{:.2f}"
+            title=f"Energy distance (pairwise)\nPDR vs Cloud {run_note}", fmt="{:.2f}"
         )
 
-        ed_rank_png = os.path.join(DIR_MCMC, f"fig_EDranking_dnn11d{run_note}.png")
+        ed_rank_png = os.path.join("mcmc__PDR", f"fig_EDranking_pdr11d{run_note}.png")
         plot_pairwise_ed_ranking(
             ED_mat, XNAMES, out_png=ed_rank_png,
-            title=f"Ranked pairwise energy distance\nDNN vs Cloud {run_note}", top_k=None
+            title=f"Ranked pairwise energy distance\nPDR vs Cloud {run_note}", top_k=None
         )
 
-        js_png = os.path.join(DIR_MCMC, f"fig_JSmatrix_dnn11d{run_note}.png")
+        js_png = os.path.join("mcmc__PDR", f"fig_JSmatrix_pdr11d{run_note}.png")
         JS_mat = compute_pairwise_js_matrix(
-            X_dnn_pool, X_true_pool, XNAMES, PMIN_11, PMAX_11,
+            X_pdr_pool, X_true_pool, XNAMES, PMIN_11, PMAX_11,
             n_grid=80, bw_2d=0.2
         )
         plot_matrix_heatmap(
             JS_mat, XNAMES,
-            title=f"JS divergence (pairwise) DNN vs Cloud {run_note}",
+            title=f"JS divergence (pairwise) PDR vs Cloud {run_note}",
             out_png=js_png, fmt="{:.3f}"
         )
 
-        summary_path = os.path.join(DIR_MCMC, f"summary_dnn11d{run_note}.txt")
+        summary_path = os.path.join('mcmc__PDR', f'summary_pdr11d{run_note}.txt')
         with open(summary_path, 'w') as f:
-            f.write("=== DNN vs Cloud MCMC Posterior Metrics ===\n")
+            f.write("=== PDR vs Cloud MCMC Posterior Metrics ===\n")
             f.write(f"Case: {'WITH radiation (OLR/OSR)' if USE_RADIATION else 'NO radiation (PCP/LWP/IWP)'}\n\n")
             f.write("Energy distance validation:\n")
-            f.write(f"  Self ED(DNN):   {ED_self_dnn:.6f}\n")
+            f.write(f"  Self ED(PDR):   {ED_self_pdr:.6f}\n")
             f.write(f"  Self ED(Cloud): {ED_self_true:.6f}\n")
-            f.write(f"  ED(DNN,Cloud):  {ED_dnn_true:.6f}\n")
-            f.write(f"  ED(Cloud,DNN):  {ED_true_dnn:.6f}\n")
-            f.write(f"  |dED|:          {abs(ED_dnn_true - ED_true_dnn):.6e}\n\n")
+            f.write(f"  ED(PDR,Cloud):  {ED_pdr_true:.6f}\n")
+            f.write(f"  ED(Cloud,PDR):  {ED_true_pdr:.6f}\n")
+            f.write(f"  |dED|:          {abs(ED_pdr_true - ED_true_pdr):.6e}\n\n")
             f.write("Pairwise ED matrix (rows/cols = XNAMES order):\n")
             np.savetxt(f, ED_mat, fmt="%.4f")
 
@@ -907,13 +681,16 @@ def run_case(USE_RADIATION: bool):
         print("Saved summary:", summary_path)
 
     except Exception as e:
-        print("[WARN] Skipping JS/ED metrics (DNN vs Cloud) due to error:", repr(e))
+        print("[WARN] Skipping JS/ED metrics (PDR vs Cloud) due to error:", repr(e))
+
 
 def main():
     print("\n=== CASE A (Fig.7): NO RADIATION ===")
     run_case(False)
+
     print("\n=== CASE B (Fig.9): WITH RADIATION ===")
     run_case(True)
+
 
 if __name__ == "__main__":
     main()
