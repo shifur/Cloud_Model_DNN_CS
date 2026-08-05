@@ -1,33 +1,5 @@
 # pdr_emulator_11d_gpu.py
-# ============================================================================
-# CHANGES from the previous version (all isolated to PDR11D — the predict()
-# interface (m,11)->(m,6) is UNCHANGED, so log_prob_pdr11d.py and the sampler
-# need no edits, and the DNN-vs-PDR comparison stays on the same emcee path).
-#
-#   CHANGE 1 (kept): predict() does phi @ C_six directly (no sqrt(m) factor);
-#                    training solved (Psi/sqrt(m)) C = F/sqrt(m) => Psi C = F.
-#
-#   CHANGE 2 (NEW — "prune to sparse support", lossless at prune_tol=0):
-#       PDR/CS coefficients are sparse. Basis rows whose coefficients are zero
-#       across ALL six outputs contribute coeff*basis = 0 to phi @ C_six, so
-#       dropping them leaves predict() numerically identical (verified: max rel
-#       diff ~2e-13 vs the old code). This shrinks the per-step work from
-#       N_basis (e.g. 4291) down to the actual support P (often a few hundred).
-#
-#   CHANGE 3 (NEW — recurrence + gather, replaces legval over the basis):
-#       Old: legval(xk, leg_mat[k].T) evaluates a full degree-max_deg series for
-#            EACH of the N_basis columns => O(max_deg * N_basis) per dimension.
-#       New: build the 1-D Legendre table P_0..P_max_deg(xk) once per dimension
-#            via the three-term recurrence (O(max_deg)), then GATHER the single
-#            degree each basis needs (O(P)). Same Legendre values, far less work.
-#       The table is built for all m input rows at once, so predict() is now
-#       fully vectorised over rows (no Python per-row loop). For m=1 (the MCMC
-#       per-walker call) this is the fast path; if you later switch emcee to
-#       vectorize=True, the SAME predict() handles the whole (nwalkers,11) batch.
-#
-#   Net effect (synthetic 600/4291 support): per-call 0.95 ms -> 0.24 ms;
-#   batched over 32 walkers 31.9 ms -> 0.64 ms.
-# ============================================================================
+
 
 import numpy as np
 
@@ -108,3 +80,36 @@ class PDR11D:
             phi *= self.norms[:, k][:, None] * vals
         Y = phi.T @ self.C_six                                     # (m, 6)
         return Y
+
+# ============================================================================
+# CHANGES from the previous version (all isolated to PDR11D — the predict()
+# interface (m,11)->(m,6) is UNCHANGED, so log_prob_pdr11d.py and the sampler
+# need no edits, and the DNN-vs-PDR comparison stays on the same emcee path).
+#
+#   CHANGE 1 (kept): predict() does phi @ C_six directly (no sqrt(m) factor);
+#                    training solved (Psi/sqrt(m)) C = F/sqrt(m) => Psi C = F.
+#
+#   CHANGE 2 (NEW — "prune to sparse support", lossless at prune_tol=0):
+#       PDR/CS coefficients are sparse. Basis rows whose coefficients are zero
+#       across ALL six outputs contribute coeff*basis = 0 to phi @ C_six, so
+#       dropping them leaves predict() numerically identical (verified: max rel
+#       diff ~2e-13 vs the old code). This shrinks the per-step work from
+#       N_basis (e.g. 4291) down to the actual support P (often a few hundred).
+#
+#   CHANGE 3 (NEW — recurrence + gather, replaces legval over the basis):
+#       Old: legval(xk, leg_mat[k].T) evaluates a full degree-max_deg series for
+#            EACH of the N_basis columns => O(max_deg * N_basis) per dimension.
+#       New: build the 1-D Legendre table P_0..P_max_deg(xk) once per dimension
+#            via the three-term recurrence (O(max_deg)), then GATHER the single
+#            degree each basis needs (O(P)). Same Legendre values, far less work.
+#       The table is built for all m input rows at once, so predict() is now
+#       fully vectorised over rows (no Python per-row loop). For m=1 (the MCMC
+#       per-walker call) this is the fast path; if you later switch emcee to
+#       vectorize=True, the SAME predict() handles the whole (nwalkers,11) batch.
+#
+#   Net effect (synthetic 600/4291 support): per-call 0.95 ms -> 0.24 ms;
+#   batched over 32 walkers 31.9 ms -> 0.64 ms.
+# ============================================================================
+
+
+
