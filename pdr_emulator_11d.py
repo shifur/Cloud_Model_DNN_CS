@@ -1,19 +1,6 @@
+
+
 # pdr_emulator_11d.py
-# CHANGES from previous version:
-#   CHANGE 1: predict() simplified — phi @ C_six directly (no sqrt(m) factor).
-#             Mathematical justification: training solves (A)C = b where
-#             A = Psi/sqrt(m) and b = F/sqrt(m), so Psi @ C = F directly.
-#
-#   CHANGE 2: _design_row_legendre_11d() replaced by _design_row_vectorised().
-#             Root cause of slowness:
-#               Old: for n in range(4291) → for k in range(11) → legendre(deg)
-#                    = 47,201 scipy object creations per predict() call → 6172 ms
-#               Fix: legval(xk, leg_mat[k].T) evaluates all 4291 polynomials
-#                    at once — only 11 Python iterations remain → 2.5 ms
-#                    = ~2400x speedup. Same math, different code path.
-#             Precomputed in __init__ (once at load):
-#               self.norms   — sqrt(2*Lambda+1), shape (N_basis, 11)
-#               self.leg_mat — unit-vector Legendre matrices, one per dimension
 
 import numpy as np
 from numpy.polynomial.legendre import legval
@@ -88,3 +75,29 @@ class PDR11D:
             phi    = self._design_row_vectorised(xi[i])   # (N_basis,)
             Y[i,:] = phi @ self.C_six                     # (6,)
         return Y
+
+# pdr_emulator_11d.py
+# CHANGES from previous version:
+#   CHANGE 1: predict() simplified — phi @ C_six directly (no sqrt(m) factor).
+#             Mathematical justification: training solves (A)C = b where
+#             A = Psi/sqrt(m) and b = F/sqrt(m), so Psi @ C = F directly.
+#
+#   CHANGE 2: _design_row_legendre_11d() replaced by _design_row_vectorised().
+#             Root cause of slowness:
+#               Old: for n in range(4291) → for k in range(11) → legendre(deg)
+#                    = 47,201 scipy object creations per predict() call → 6172 ms
+#               Fix: legval(xk, leg_mat[k].T) evaluates all 4291 polynomials
+#                    at once — only 11 Python iterations remain → 2.5 ms
+#                    = ~2400x speedup. Same math, different code path.
+#             Precomputed in __init__ (once at load):
+#               self.norms   — sqrt(2*Lambda+1), shape (N_basis, 11)
+#               self.leg_mat — unit-vector Legendre matrices, one per dimension
+
+
+
+
+
+
+
+
+
