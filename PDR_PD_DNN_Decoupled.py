@@ -428,13 +428,6 @@ def main():
             norm = np.sqrt((2 * Lambda[n, kdim] + 1))
             Psi_sg[:, n] *= norm * Pk(xi_can[:, kdim])
 
-    # SG Gram diagnostics (optional)
-    w_prob = w_can / (2.0 ** d)
-    G_sg = Psi_sg.T @ (w_prob[:, None] * Psi_sg)
-    diag_err = np.max(np.abs(np.diag(G_sg) - 1.0))
-    offdiag_err = np.max(np.abs(G_sg - np.diag(np.diag(G_sg))))
-    print(f"SG Gram matrix - Diagonal error: {diag_err:.2e}, Off-diagonal error: {offdiag_err:.2e}")
-
     # Physical quadrature weights
     volume_phys = np.prod(pmax - pmin)
     w_phys = w_can * (volume_phys / (2.0 ** d))
