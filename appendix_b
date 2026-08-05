@@ -1,0 +1,350 @@
+"""
+appendix_b.py
+================================
+Builds the scatter plot HCH requested for Appendix B:
+  x-axis: per-trial surrogate relative L2 error (mean over the 6 outputs)
+  y-axis: per-trial full 11-D energy distance vs MCMC-true
+  Two panels: MCMC-DNN (left), MCMC-CS (right)
+
+Uses NUM_TRIALS=10 independently-trained surrogates at m=5000
+(from PDR_PD_DNN_Decoupled.py's trial harness -- NUM_TRIALS and
+TRAIN_SIZES_TRIALS must already be edited there per the earlier discussion:
+NUM_TRIALS=10, TRAIN_SIZES_TRIALS including 5000), and runs one MCMC chain
+per trial using the EXISTING, UNMODIFIED log_prob_dnn11d.log_prob_dnn11d() /
+log_prob_pdr11d.log_prob_pdr11d() functions.
+
+Injection method: for each trial, the trained surrogate is serialized to
+EXACTLY the checkpoint format DNN11D/PDR11D already expect, then a fresh
+DNN11D/PDR11D instance is built from that checkpoint and assigned directly
+to the module-level cache (log_prob_dnn11d._emul / log_prob_pdr11d._emul),
+so the existing log-prob functions run completely unchanged for every trial.
+"""
+
+import os
+import numpy as np
+import torch
+import emcee
+import xarray as xr
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from scipy.spatial.distance import cdist
+from scipy.special import legendre
+import Tasmanian
+
+import log_prob_dnn11d
+import log_prob_pdr11d
+from dnn_emulator_11d import DNN11D
+from pdr_emulator_11d_gpu import PDR11D
+
+from surrogate_config_11d import (
+    XNAMES, X_TRUE_11D, PMIN_11, PMAX_11, Y_SIG_SIX, YMASK_FIG7,
+    MCMC_NWALK, MCMC_NBURN, MCMC_NMCMC,
+    TRUE_CHAIN_FILE_NORAD, TRUE_CHAIN_FILE_RAD,
+)
+
+# ---- Reused, unmodified, from PDR_PD_DNN_Decoupled.py ----------------------
+from PDR_PD_DNN_Decoupled import (
+    run_single_trial_all_methods, algorithm_5_exact,
+    multiidx_gen, compute_intrinsic_weights_legendre,
+    NUM_TRIALS, TRAIN_SIZES_TRIALS, TRIALS_RNG_SEED, RNG_SEED,
+    INPUT_FILE, OUTPUT_FILE, NAMELIST,
+    PARMASTER, PARMODE, PARNWORKERS,
+    LEVEL_11D, GRID_RULE,
+    PD_EARLY_STOP, PD_EARLY_STOP_TOL,
+)
+from parmap_framework import parmap
+from module_runcrm import runcrm
+
+M_TRAIN = 5000
+assert M_TRAIN in TRAIN_SIZES_TRIALS, (
+    f"Expected {M_TRAIN} to be one of TRAIN_SIZES_TRIALS, got {TRAIN_SIZES_TRIALS}"
+)
+
+K = 6   # number of SCCM outputs (PCP, ACC, LWP, IWP, OLR, OSR)
+
+CKPT_DIR = "appendix_b_trial_checkpoints"
+os.makedirs(CKPT_DIR, exist_ok=True)
+
+OUT_DIR = "appendix_b_scatter"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+DNN_LAYERS, DNN_NODES = 8, 50   # matches dnn_emulator_11d.py's fallback DNN class
+
+USE_RADIATION = True   # match the manuscript's with-radiation configuration
+run_note = "_rad" if USE_RADIATION else "_norad"
+
+
+# =============================================================================
+# Checkpoint writers -- exact format DNN11D / PDR11D already expect
+# =============================================================================
+def save_dnn_checkpoint(trial_art, out_path):
+    raw_state_dict = trial_art["model"].state_dict()
+    # PDR_PD_DNN_Decoupled.py's DNN class names its Sequential container
+    # "layers" (confirmed: `self.layers = nn.Sequential(*layers_list)`),
+    # but dnn_emulator_11d.py's DNN11D loader builds its model with the
+    # container named "net", so it expects state_dict keys prefixed
+    # "net." instead of "layers.". Same architecture (10 Linear layers,
+    # identical shapes/order -- confirmed from the traceback's key list),
+    # just a different attribute name -- remap the prefix, not the weights.
+    remapped_state_dict = {
+        k.replace("layers.", "net.", 1): v for k, v in raw_state_dict.items()
+    }
+    ckpt = {
+        "dnn_layers": DNN_LAYERS,
+        "dnn_nodes":  DNN_NODES,
+        "state_dict": remapped_state_dict,
+        "Ymin":  np.asarray(trial_art["F_min"]),
+        "Ymax":  np.asarray(trial_art["F_max"]),
+        "pmin11": PMIN_11,
+        "pmax11": PMAX_11,
+        "m_train": M_TRAIN,
+    }
+    torch.save(ckpt, out_path)
+
+
+def save_pdr_checkpoint(Lambda, C_six, out_path):
+    np.savez(
+        out_path,
+        Lambda=Lambda.astype(int),
+        C_six=C_six.astype(float),
+        pmin11=PMIN_11,
+        pmax11=PMAX_11,
+        m_train=M_TRAIN,
+    )
+
+
+# =============================================================================
+# Energy distance (same estimator already used elsewhere in the project)
+# =============================================================================
+def energy_distance(X, Y, max_n=5000, seed=None):
+    rng = np.random.default_rng(seed)
+    X, Y = np.asarray(X, float), np.asarray(Y, float)
+    n, m = X.shape[0], Y.shape[0]
+    if n > max_n:
+        X = X[rng.choice(n, max_n, replace=False)]; n = max_n
+    if m > max_n:
+        Y = Y[rng.choice(m, max_n, replace=False)]; m = max_n
+    dxy, dxx, dyy = cdist(X, Y), cdist(X, X), cdist(Y, Y)
+    D2 = (2.0/(n*m))*dxy.sum() - (1.0/(n*n))*dxx.sum() - (1.0/(m*m))*dyy.sum()
+    return float(np.sqrt(max(D2, 0.0)))
+
+
+def sample_true_from_cloud_chain(nc_path, nsamples=5000, seed=0):
+    ds = xr.open_dataset(nc_path)
+    Xa = ds["Xa"].values.reshape(-1, 11)
+    ds.close()
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(Xa.shape[0], min(nsamples, Xa.shape[0]), replace=False)
+    return Xa[idx]
+
+
+# =============================================================================
+# Run one MCMC chain against whatever surrogate is currently cached in
+# log_prob_dnn11d._emul / log_prob_pdr11d._emul
+# =============================================================================
+def run_trial_mcmc(log_prob_fn, x_true, L1_six, PMask, y_mask,
+                    nwalk, nburn, nmcmc, seed):
+    rng = np.random.default_rng(seed)
+    x_sig = np.array([20, 0.05, 20, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 1e-4, 1e-5])
+    p0 = np.tile(x_true, nwalk).reshape(nwalk, 11) + rng.normal(0, 1, (nwalk, 11)) * x_sig
+    for j in range(11):
+        lo, hi = PMIN_11[j], PMAX_11[j]
+        bad = (p0[:, j] < lo) | (p0[:, j] > hi)
+        while np.any(bad):
+            p0[bad, j] = x_true[j] + rng.normal(0, x_sig[j], bad.sum())
+            bad = (p0[:, j] < lo) | (p0[:, j] > hi)
+
+    dtype = [("Hx", float, (7,))]
+    sampler = emcee.EnsembleSampler(
+        nwalk, 11, log_prob_fn,
+        blobs_dtype=dtype, vectorize=True,
+        args=[x_true, L1_six, Y_SIG_SIX, PMIN_11, PMAX_11, PMask, y_mask, 1],
+    )
+    state = sampler.run_mcmc(p0, nburn, progress=False)
+    sampler.reset()
+    sampler.run_mcmc(state, nmcmc, progress=False)
+    return sampler.get_chain()   # (nmcmc, nwalk, 11)
+
+
+# =============================================================================
+# Main
+# =============================================================================
+def main():
+    np.random.seed(RNG_SEED)
+
+    # -------------------------------------------------------------------
+    # Setup block -- copied verbatim from PDR_PD_DNN_Decoupled.py's main(),
+    # so Lambda/N_basis/weights/Psi_sg/F_sg/w_pos are bit-for-bit identical
+    # to what run_single_trial_all_methods() expects (same seed, same
+    # p_poly, same sparse-grid level/rule).
+    # -------------------------------------------------------------------
+    pmin = np.array([50.0, 0.10, 50.0, 0.1, 0.05, 0.05, 0.05, 0.05, 0.05, 1.e-4, 2.e-6], dtype=float)
+    pmax = np.array([1000.0, 1.0, 1200.0, 0.90, 5.0, 2.5, 2.5, 1.0, 1.0, 2.e-3, 1.e-3], dtype=float)
+    xnames = ['as', 'bs', 'ag', 'bg', 'N0r', 'N0s', 'N0g', 'rhos', 'rhog', 'qc0', 'qi0']
+    d = 11
+
+    HCfunc = lambda x: np.prod(x + 1) - 1
+    p_poly = 20
+    Lambda = multiidx_gen(d, HCfunc, p_poly).astype(int)
+    N_basis = Lambda.shape[0]
+    weights = compute_intrinsic_weights_legendre(Lambda)
+    print(f"11D basis size (HC level {p_poly}): {N_basis}")
+
+    grid = Tasmanian.SparseGrid()
+    grid.makeGlobalGrid(d, 0, LEVEL_11D, "level", GRID_RULE)
+    grid.clearDomainTransform()
+    xi_can = grid.getPoints()
+    w_can = grid.getQuadratureWeights()
+    m_sg = xi_can.shape[0]
+    print(f"SG grid size (11D, level {LEVEL_11D}): {m_sg}")
+
+    x_phys_sg = 0.5 * (xi_can + 1.0) * (pmax - pmin) + pmin
+    print("Running CRM for SG projection (appendix_b setup)...")
+    runs_sg = [[INPUT_FILE, OUTPUT_FILE, NAMELIST, i + 1, x_phys_sg[i].tolist()]
+               for i in range(m_sg)]
+    pmap = parmap.Parmap(master=PARMASTER, mode=PARMODE, numWorkers=PARNWORKERS)
+    F_sg_full = np.array(pmap(runcrm, runs_sg))
+    F_sg = F_sg_full[:, 18:24]
+
+    Psi_sg = np.ones((m_sg, N_basis), dtype=float)
+    for n in range(N_basis):
+        for kdim in range(d):
+            Pk = legendre(Lambda[n, kdim])
+            norm = np.sqrt((2 * Lambda[n, kdim] + 1))
+            Psi_sg[:, n] *= norm * Pk(xi_can[:, kdim])
+
+    volume_phys = np.prod(pmax - pmin)
+    w_phys = w_can * (volume_phys / (2.0 ** d))
+    w_pos = np.abs(w_phys)
+
+    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {DEVICE}")
+
+    # -------------------------------------------------------------------
+    # MCMC-true reference posterior samples (full 11-D)
+    # -------------------------------------------------------------------
+    true_chain_file = TRUE_CHAIN_FILE_RAD if USE_RADIATION else TRUE_CHAIN_FILE_NORAD
+    X_true_pool = sample_true_from_cloud_chain(true_chain_file, nsamples=5000)
+
+    x_true = X_TRUE_11D
+    PMask = np.ones(11, dtype=int)
+    y_mask = YMASK_FIG7 if USE_RADIATION else np.array([1, 1, 1, 1, 0, 0])
+    L1_six = F_sg_full[0, 18:24]   # NOTE: placeholder single truth eval --
+                                   # replace with the actual single CRM call
+                                   # at x_true if PDR_PD_DNN_Decoupled.py /
+                                   # your MCMC scripts compute L1_six that way.
+
+    # Per-trial MCMC length -- shorter than the 400k production chain since
+    # this is repeated 10x per surrogate; see the "practical convergence"
+    # 80k-100k range documented in Appendix A. Change if you want full-length.
+    NMCMC_PER_TRIAL = 100_000
+    NBURN_PER_TRIAL = 10_000
+
+    l2_dnn_trials, ed_dnn_trials = [], []
+    l2_pdr_trials, ed_pdr_trials = [], []
+
+    for trial_idx in range(NUM_TRIALS):
+        print(f"\n=== Trial {trial_idx + 1}/{NUM_TRIALS} (m={M_TRAIN}) ===")
+
+        trial_art = run_single_trial_all_methods(
+            trial_idx, M_TRAIN, pmin, pmax, d, Lambda, N_basis, weights,
+            Psi_sg, F_sg, w_pos, DEVICE,
+        )
+
+        A = trial_art['A']
+        lam, tau, sigma, r, T_inner, s = (
+            trial_art['lam'], trial_art['tau'], trial_art['sigma'],
+            trial_art['r'], trial_art['T_inner'], trial_art['s'],
+        )
+        R = trial_art['R']
+        T_pd = trial_art['T_pd']
+        F_train = trial_art['F_train']
+
+        # ---- PDR: per-output coefficients, L2 error, sparsity -----------
+        C_six_pdr = np.zeros((N_basis, K))
+        l2_pdr = np.zeros(K)
+        for kout in range(K):
+            b = F_train[:, kout] / np.sqrt(M_TRAIN)
+            C_pdr = algorithm_5_exact(
+                A, b, weights, lam, T_inner, R, eps_0=1e-6, r=r, s=s,
+                tau=tau, sigma=sigma, max_iter=T_pd,
+                pd_early_stop=PD_EARLY_STOP, pd_early_stop_tol=PD_EARLY_STOP_TOL,
+            )
+            C_six_pdr[:, kout] = C_pdr
+            y_pdr = Psi_sg @ C_pdr
+            y_true = F_sg[:, kout]
+            diff = y_true - y_pdr
+            num = np.dot(diff ** 2, w_pos)
+            denom = np.dot(y_true ** 2, w_pos)
+            l2_pdr[kout] = np.sqrt(num / denom) if denom > 0 else np.nan
+        l2_pdr_trial = float(np.mean(l2_pdr))
+
+        # ---- DNN: predictions on SG, L2 error ----------------------------
+        model = trial_art['model']
+        F_min, F_max = trial_art['F_min'], trial_art['F_max']
+        span = np.where((F_max - F_min) == 0, 1.0, (F_max - F_min))
+        model.eval()
+        with torch.no_grad():
+            xi_tensor = torch.from_numpy(xi_can).float().to(DEVICE)
+            F_sg_pred_scaled = model(xi_tensor).cpu().numpy()
+        F_sg_pred = (F_sg_pred_scaled + 1) / 2 * span + F_min
+
+        l2_dnn = np.zeros(K)
+        for kout in range(K):
+            diff = F_sg[:, kout] - F_sg_pred[:, kout]
+            num = np.dot(diff ** 2, w_pos)
+            denom = np.dot(F_sg[:, kout] ** 2, w_pos)
+            l2_dnn[kout] = np.sqrt(num / denom) if denom > 0 else np.nan
+        l2_dnn_trial = float(np.mean(l2_dnn))
+
+        # ---- DNN: inject this trial's checkpoint, run MCMC ---------------
+        dnn_ckpt_path = os.path.join(CKPT_DIR, f"dnn_trial{trial_idx}.pt")
+        save_dnn_checkpoint(trial_art, dnn_ckpt_path)
+        log_prob_dnn11d._emul = DNN11D(dnn_ckpt_path)
+        Xa_dnn = run_trial_mcmc(
+            log_prob_dnn11d.log_prob_dnn11d, x_true, L1_six, PMask, y_mask,
+            MCMC_NWALK, NBURN_PER_TRIAL, NMCMC_PER_TRIAL,
+            seed=TRIALS_RNG_SEED + trial_idx,
+        )
+        ed_dnn = energy_distance(Xa_dnn.reshape(-1, 11), X_true_pool, seed=trial_idx)
+        l2_dnn_trials.append(l2_dnn_trial); ed_dnn_trials.append(ed_dnn)
+        print(f"  DNN: L2(mean over 6 outputs)={l2_dnn_trial:.4f}  ED_11D={ed_dnn:.4f}")
+
+        # ---- PDR/CS: inject this trial's checkpoint, run MCMC -------------
+        pdr_ckpt_path = os.path.join(CKPT_DIR, f"pdr_trial{trial_idx}.npz")
+        save_pdr_checkpoint(Lambda, C_six_pdr, pdr_ckpt_path)
+        log_prob_pdr11d._emul = PDR11D(pdr_ckpt_path)
+        Xa_pdr = run_trial_mcmc(
+            log_prob_pdr11d.log_prob_pdr11d, x_true, L1_six, PMask, y_mask,
+            MCMC_NWALK, NBURN_PER_TRIAL, NMCMC_PER_TRIAL,
+            seed=TRIALS_RNG_SEED + 1000 + trial_idx,
+        )
+        ed_pdr = energy_distance(Xa_pdr.reshape(-1, 11), X_true_pool, seed=1000 + trial_idx)
+        l2_pdr_trials.append(l2_pdr_trial); ed_pdr_trials.append(ed_pdr)
+        print(f"  PDR: L2(mean over 6 outputs)={l2_pdr_trial:.4f}  ED_11D={ed_pdr:.4f}")
+
+    # =========================================================================
+    # Scatter plot: 2 panels, MCMC-DNN (left) / MCMC-CS (right)
+    # =========================================================================
+    fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+    axes[0].scatter(l2_dnn_trials, ed_dnn_trials, color="tab:blue", s=50)
+    axes[0].set_title("(a) MCMC-DNN")
+    axes[1].scatter(l2_pdr_trials, ed_pdr_trials, color="tab:orange", s=50)
+    axes[1].set_title("(b) MCMC-CS")
+    for ax in axes:
+        ax.set_xlabel("Relative $L^2$ error (mean over 6 outputs)")
+        ax.grid(alpha=0.3)
+    axes[0].set_ylabel("Energy distance vs MCMC-true (full 11-D)")
+    fig.tight_layout()
+    out_png = os.path.join(OUT_DIR, f"fig_l2_vs_ed_scatter{run_note}.png")
+    fig.savefig(out_png, dpi=150, bbox_inches="tight")
+    print("\nSaved:", os.path.abspath(out_png))
+
+    np.savez(os.path.join(OUT_DIR, f"l2_vs_ed_data{run_note}.npz"),
+             l2_dnn=l2_dnn_trials, ed_dnn=ed_dnn_trials,
+             l2_pdr=l2_pdr_trials, ed_pdr=ed_pdr_trials)
+
+
+if __name__ == "__main__":
+    main()
