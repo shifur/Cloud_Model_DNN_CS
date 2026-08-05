@@ -1,0 +1,186 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.special import legendre
+import cvxpy as cp
+import sys
+import time
+
+# Ensure custom packages are found
+sys.path.append('/home/ss24ce/.local/lib/python3.10/site-packages')
+import Tasmanian
+from parmap_framework import parmap
+from module_runcrm import runcrm
+
+# =============================================================================
+# 1. Setup & Multi-Index Generation (1D rhiog-only)
+# =============================================================================
+np.random.seed(42)
+d = 1  # 1D: only rhiog
+K = 6
+pmin_rhiog = 0.05
+pmax_rhiog = 1.0
+
+def map_rhiog_to_canonical(r):
+    return 2 * (r - pmin_rhiog) / (pmax_rhiog - pmin_rhiog) - 1
+
+p_poly = 300
+HCfunc = lambda idx: np.prod(idx + 1) - 1
+
+def multiidx_gen(N, rule, w, base=0, multiidx=np.array([]), MULTI_IDX=np.array([])):
+    if len(multiidx) != N:
+        i = base
+        while rule(np.append(multiidx, i)) <= w:
+            MULTI_IDX = multiidx_gen(N, rule, w, base,
+                                     np.append(multiidx, i), MULTI_IDX)
+            i += 1
+    else:
+        MULTI_IDX = np.vstack([MULTI_IDX, multiidx]) if MULTI_IDX.size else multiidx
+    return MULTI_IDX
+
+Lambda_rhiog = multiidx_gen(d, HCfunc, p_poly).astype(int)
+N_basis_rhiog = Lambda_rhiog.shape[0]
+print(f"1D rhiog-only basis size: {N_basis_rhiog}")
+
+# =============================================================================
+# 2. Sparse-Grid (SG) Projection in 1-D 'rhiog'
+# =============================================================================
+grid_sg = Tasmanian.SparseGrid()
+grid_sg.makeGlobalGrid(1, 0, 15, "level", "clenshaw-curtis")
+grid_sg.clearDomainTransform()
+xi_can_1d = grid_sg.getPoints().flatten()
+w_can_1d  = grid_sg.getQuadratureWeights()
+m_sg      = xi_can_1d.size
+print(f"SG grid size: {m_sg}")
+
+rhiog_phys = 0.5 * (xi_can_1d + 1) * (pmax_rhiog - pmin_rhiog) + pmin_rhiog
+# Assuming rhiog goes at index 8
+fixed_input = [525.0, 0.55, 800.0, 0.5, 2.525, 1.275, 1.275, 0.525, None, 0.00105, 0.000501]
+
+x_phys_sg = []
+for val in rhiog_phys:
+    inp = fixed_input.copy()
+    inp[8] = val  # rhiog at index 8
+    x_phys_sg.append(inp)
+x_phys_sg = np.array(x_phys_sg)
+
+tunes_sg = [[
+    './cloud_column_model/run_one_crm1d.txt',
+    './cloud_column_model/crm1d_output.txt',
+    './cloud_column_model/namelist_3h_t30-180.f90',
+    i+1,
+    x_phys_sg[i].tolist()
+] for i in range(m_sg)]
+
+print("Running CRM for SG projection (1D rhiog)…")
+pmap = parmap.Parmap(master='scispark6.jpl.nasa.gov:8786', mode='par', numWorkers=12)
+F_sg_full = np.array(pmap(runcrm, tunes_sg))
+F_sg = F_sg_full[:, 18:24]
+
+Psi_sg = np.ones((m_sg, N_basis_rhiog))
+for n in range(N_basis_rhiog):
+    deg = int(Lambda_rhiog[n, 0])
+    Pdeg = legendre(deg)
+    norm = np.sqrt((2*deg + 1)/2)
+    Psi_sg[:, n] = norm * Pdeg(xi_can_1d)
+
+coeff_sg = Psi_sg.T @ (w_can_1d[:, None] * F_sg)
+
+# =============================================================================
+# 3. Compressed-Sensing (CS) in 1-D 'rhiog'
+# =============================================================================
+m_train = 150
+rhiog_train = np.linspace(pmin_rhiog, pmax_rhiog, m_train)
+xi_train = map_rhiog_to_canonical(rhiog_train)
+
+x_train = []
+for val in rhiog_train:
+    inp = fixed_input.copy()
+    inp[8] = val  # rhiog at index 8
+    x_train.append(inp)
+x_train = np.array(x_train)
+
+runs_train = [[
+    './cloud_column_model/run_one_crm1d.txt',
+    './cloud_column_model/crm1d_output.txt',
+    './cloud_column_model/namelist_3h_t30-180.f90',
+    i+1,
+    x_train[i].tolist()
+] for i in range(m_train)]
+
+print("Running CRM for CS training (1D rhiog)…")
+F_train_full = np.array(pmap(runcrm, runs_train))
+F_train = F_train_full[:, 18:24]
+
+A = np.zeros((m_train, N_basis_rhiog))
+for n in range(N_basis_rhiog):
+    deg = int(Lambda_rhiog[n, 0])
+    Pdeg = legendre(deg)
+    norm = np.sqrt((2*deg + 1)/2)
+    A[:, n] = norm * Pdeg(xi_train)
+A /= np.sqrt(m_train)
+b = F_train / np.sqrt(m_train)
+
+mu_val = 1e-5
+xhat_lasso = np.zeros((N_basis_rhiog, K))
+t0 = time.time()
+for k in range(K):
+    xvar = cp.Variable(N_basis_rhiog)
+    obj = mu_val * cp.norm1(xvar) + cp.norm(A @ xvar - b[:, k], 2)
+    prob = cp.Problem(cp.Minimize(obj))
+    prob.solve(solver=cp.CLARABEL)
+    xhat_lasso[:, k] = xvar.value
+end = time.time()
+
+print("xhat_lasso shape:", xhat_lasso.shape)
+print(f"SR-LASSO solved in {end - t0:.1f}s; nonzeros: {np.count_nonzero(np.abs(xhat_lasso) > 1e-12)}")
+
+# =============================================================================
+# Coefficient Comparison: PCP and OLR merged into a single 4-panel figure
+# Panels are labeled (a)-(d) in reading order (left-to-right, top-to-bottom):
+#   (a) PCP unsorted   (b) PCP sorted
+#   (c) OLR unsorted   (d) OLR sorted
+# =============================================================================
+N = N_basis_rhiog
+inds = np.arange(N)
+output_names = ['PCP', 'ACC', 'LWP', 'IWP', 'OLR', 'OSR']
+
+panel_outputs = ['PCP', 'OLR']          # only these two are shown
+panel_labels  = ['(a)', '(b)', '(c)', '(d)']
+
+fig, axs = plt.subplots(2, 2, figsize=(14, 10))
+
+for row, name in enumerate(panel_outputs):
+    k = output_names.index(name)
+    xhat_SG = coeff_sg[:, k]
+    xhat_CS = xhat_lasso[:, k]
+
+    # --- Unsorted Coefficient Comparison (left column) ---
+    ax_u = axs[row, 0]
+    ax_u.plot(inds, np.abs(xhat_SG), 'o', label='SG', alpha=0.7, color='red')
+    ax_u.plot(inds, np.abs(xhat_CS), '+', label='CS', alpha=0.7, color='blue')
+    ax_u.set_yscale('log')
+    ax_u.set_xlabel('Basis Index')
+    ax_u.set_ylabel('|Coefficient|')
+    ax_u.set_title(f'Unsorted Coefficients: {name}')
+    ax_u.legend()
+    ax_u.grid(True)
+
+    # --- Sorted Coefficient Decay (right column) ---
+    ax_s = axs[row, 1]
+    ax_s.scatter(inds, np.sort(np.abs(xhat_SG))[::-1], marker='x', label='SG', color='red')
+    ax_s.scatter(inds, np.sort(np.abs(xhat_CS))[::-1], marker='+', label='CS', color='blue')
+    ax_s.set_yscale('log')
+    ax_s.set_xlabel('Sorted Index')
+    ax_s.set_ylabel('|Coefficient|')
+    ax_s.set_title(f'Sorted Coefficient Decay: {name}')
+    ax_s.legend()
+    ax_s.grid(True)
+
+# Add (a)-(d) panel labels in the top-left corner of each subplot
+for ax, lbl in zip(axs.flatten(), panel_labels):
+    ax.text(-0.08, 1.02, lbl, transform=ax.transAxes,
+            fontsize=14, fontweight='bold', va='bottom', ha='right')
+
+plt.tight_layout()
+plt.savefig('figures/coeff_decay_PCP_OLR.png', dpi=300, bbox_inches='tight')
+plt.show()
